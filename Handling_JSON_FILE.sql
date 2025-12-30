@@ -1,0 +1,210 @@
+CREATE OR REPLACE STORAGE INTEGRATION AZURE_BLOB_INT
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = AZURE
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '16625689-dffc-4ee5-b9de-2d326a40554c'
+  STORAGE_ALLOWED_LOCATIONS = ('azure://akhilsnowflake.blob.core.windows.net/demofile/demofiles/');
+
+DESC INTEGRATION AZURE_BLOB_INT;
+
+-- Generic JSON format (arrays → rows; strip nulls for compact objects)
+CREATE OR REPLACE FILE FORMAT FF_JSON
+  TYPE = JSON
+  STRIP_OUTER_ARRAY = TRUE
+  STRIP_NULL_VALUES = TRUE
+  IGNORE_UTF8_ERRORS = TRUE;
+
+-- External stage (point at your container root)
+CREATE OR REPLACE STAGE AZ_STAGE_JSON
+  URL = 'azure://akhilsnowflake.blob.core.windows.net/demofile/demofiles/'
+  STORAGE_INTEGRATION = AZURE_BLOB_INT
+  FILE_FORMAT = (FORMAT_NAME = FF_JSON);
+
+LIST @AZ_STAGE_JSON;
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION MY_NOTIFICATION_INT
+  TYPE = QUEUE
+  NOTIFICATION_PROVIDER = AZURE_STORAGE_QUEUE
+  AZURE_STORAGE_QUEUE_PRIMARY_URI = 'https://akhilsnowflake.queue.core.windows.net/snowpipedemo'
+  AZURE_TENANT_ID = '16625689-dffc-4ee5-b9de-2d326a40554c'
+  ENABLED = TRUE;
+
+DESC INTEGRATION MY_NOTIFICATION_INT; 
+
+CREATE OR REPLACE TABLE STG_SALES_JSON (
+  RAW VARIANT,
+  FILE_NAME STRING,
+  LOAD_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+CREATE OR REPLACE PIPE P_SALES_JSON
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'MY_NOTIFICATION_INT'
+AS
+COPY INTO STG_SALES_JSON (RAW, FILE_NAME)
+FROM (
+  SELECT $1, METADATA$FILENAME
+  FROM @AZ_STAGE_JSON
+)
+FILE_FORMAT = (FORMAT_NAME = FF_JSON);
+
+
+
+ALTER PIPE P_SALES_JSON REFRESH;
+
+select * from STG_SALES_JSON;
+
+SELECT 
+    RAW:orderId:: STRING AS ORDER_ID,
+    RAW:region::STRING AS REGION,
+    RAW:customer:tier::STRING AS CUSTOMER_TIER,
+    ARRAY_SIZE(RAW:items) AS NUM_ITEMS,
+    RAW:items as ITEMS_ARRAY
+FROM STG_SALES_JSON;
+
+select RAW:orderId, i.value from STG_SALES_JSON, LATERAL FLATTEN(INPUT => RAW:items) i;
+
+SELECT
+ RAW:orderId:: STRING AS ORDER_ID,
+ i.value:productId::NUMBER AS PRODUCT_ID,
+ i.value:qty::NUMBER AS QTY,
+ i.value:price::NUMBER AS PRICE,
+ (i.value:price::NUMBER * i.value:qty::NUMBER)::NUMBER(12,2) AS LINE_TOTAL
+ from STG_SALES_JSON,
+ LATERAL FLATTEN(INPUT => RAW:items) i;
+
+with expanded as(
+SELECT 
+  RAW:orderId::STRING AS ORDER_ID,
+  (i.value:qty::NUMBER * i.value:price::NUMBER)::NUMBER(12,2) AS LINE_TOTAL,
+  RAW:discount::NUMBER AS DISCOUNT
+  FROM STG_SALES_JSON,
+  LATERAL FLATTEN(INPUT => RAW:items) i
+)
+
+SELECT ORDER_ID,
+    SUM(LINE_TOTAL) AS GROSS_AMOUNT,
+    ANY_VALUE(DISCOUNT) AS DISCOUNT,
+    SUM(LINE_TOTAL) - ANY_VALUE(DISCOUNT) AS NET_WORTH
+FROM expanded
+GROUP BY ORDER_ID;
+
+select FILE_NAME,
+        try_parse_json(RAW) IS NOT NULL AS IS_VALID_JSON,
+        COUNT(*) AS TOTAL_RAWS
+FROM STG_SALES_JSON
+GROUP BY FILE_NAME, IS_VALID_JSON
+
+SELECT 
+OBJECT_CONSTRUCT('Order', RAW:orderId, 'Region', RAW:region, 'Tier', RAW:customer:tier) as ORDER_OBJECT
+from STG_SALES_JSON
+
+CREATE OR REPLACE TABLE customer_orders
+USING TEMPLATE (
+     SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+     FROM TABLE (
+        INFER_SCHEMA(
+            LOCATION => '@AZ_STAGE_JSON',
+            FILE_FORMAT => 'FF_JSON'
+        )
+     )
+);
+
+copy into customer_orders
+from @AZ_STAGE_JSON
+FILE_FORMAT = (FORMAT_NAME = 'FF_JSON')
+MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;
+
+
+SELECT * FROM customer_orders
+
+with prod as (
+    select RAW:orderId::STRING AS ORDER_ID,
+            i.value:price::NUMBER(12,2) AS Price,
+            i.value:sku::STRING AS SKU
+    from STG_SALES_JSON, LATERAL FLATTEN (INPUT => RAW:items) i
+)
+SELECT ORDER_ID,
+ARRAY_AGG(OBJECT_CONSTRUCT(SKU,Price)) AS PRODUCT_ARRAY,
+LISTAGG(SKU,',') WITHIN GROUP (ORDER BY SKU) AS PRODUCT_LIST
+FROM 
+prod
+group by ORDER_ID
+
+create database chroma 
+create schema chroma.INT
+
+use schema chroma.INT
+
+create or replace TABLE FACT_SALES AS 
+SELECT
+    RAW:orderId::STRING AS SALES_ID,
+    TO_DATE(RAW:orderTs) as SALES_DATE,
+    RAW:region::STRING AS REGION,
+    RAW:customer:id::NUMBER AS CUSTOMER_ID,
+    RAW:customer:tier::STRING AS LOYALTY_TIER,
+    i.value:productId:NUMBER AS PRODUCT_ID,
+    i.value:qty::NUMBER AS QUANTITY,
+    i.value:price::NUMBER AS PRICE,
+    (i.value:price::NUMBER * i.value:qty::NUMBER)::NUMBER(12,2) AS GROSS_AMOUNT,
+    RAW:discount::NUMBER AS DISCOUNT,
+    ((i.value:qty::NUMBER * i.value:price::NUMBER)- (RAW:discount:: NUMBER / ARRAY_SIZE(RAW:items))) as 
+    NET_AMOUNT,
+    RAW:payment:type::STRING AS PAYMENT_TYPE,
+    FROM SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON,
+    LATERAL FLATTEN(INPUT => RAW:items) i;
+
+SELECT REGION,
+    COUNT(DISTINCT SALES_ID) AS ORDERS,
+    SUM(GROSS_AMOUNT) AS GROSS_SALES,
+    SUM(NET_AMOUNT) AS NET_SALES,
+    ROUND(AVG(DISCOUNT),2) AS AVG_DISCOUNT
+FROM FACT_SALES
+GROUP BY REGION
+ORDER BY NET_SALES DESC;
+
+INSERT INTO SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON (RAW, FILE_NAME)
+SELECT
+  PARSE_JSON($${
+    "orderId": "ORD-9001",
+    "region": "North",
+    "customer": { "id": 101, "tier": "Gold" },
+    "items": [
+      { "productId": 501, "sku": "EL-TV-55", "qty": 2, "price": 699.99 },
+      { "productId": 502, "sku": "EL-SN-01", "qty": 1, "price": 59.99 }
+    ]
+  }$$),
+  'akhil.json';
+
+
+SELECT
+RAW:items[0]:sku::STRING AS FIRST_PRODUCT
+FROM SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON;
+
+UPDATE SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON
+SET RAW = OBJECT_INSERT(RAW,'region', 'CENTRAL', TRUE)
+WHERE RAW:orderId::STRING = 'ORD-9001';
+
+update SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON
+SET RAW = OBJECT_INSERT(RAW,
+                        'customer',
+                        OBJECT_CONSTRUCT('id',RAW:customer:id, 'tier','Platinum'),
+                        TRUE
+                        )
+WHERE RAW:orderId::STRING = 'ORD-9001'
+
+UPDATE SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON
+SET RAW = OBJECT_INSERT(RAW,'tier', 'Gold', TRUE)
+WHERE RAW:orderId::STRING = 'ORD-9001';
+
+
+
+SELECT * FROM SNOWFLAKE_LEARNING_DB.PUBLIC.STG_SALES_JSON
+WHERE RAW:orderId:: STRING ='ORD-9001'
+
+
+
+
+  
+

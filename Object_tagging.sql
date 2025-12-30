@@ -1,0 +1,47 @@
+CREATE OR REPLACE TAG DATA_SENSITIVITY ALLOWED_VALUES 'PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'PII' COMMENT = 'Marks the sensitivity level of data';
+
+SHOW TAGS IN ACCOUNT;
+
+CREATE OR REPLACE TAG COST_CENTER COMMENT = 'Used for cost attribution or ownership tracking';
+
+CREATE OR REPLACE TAG OWNER COMMENT = 'Department or team responsible for the object';
+  
+CREATE OR REPLACE TAG DATA_RETENTION_POLICY ALLOWED_VALUES '7_DAYS', '30_DAYS', '1_YEAR', 'INDEFINITE' COMMENT = 'Specifies how long the data should be retained';
+
+CREATE OR REPLACE TAG COMPLIANCE_CLASS ALLOWED_VALUES 'GDPR', 'HIPAA', 'PCI', 'NONE' COMMENT = 'Marks compliance regime for data objects';
+
+--this for table level tags
+CREATE OR REPLACE TABLE CUSTOMERS (
+  CUSTOMER_ID INT,
+  NAME STRING,
+  EMAIL STRING,
+  SSN STRING,
+  COUNTRY STRING,
+  CREATED_AT DATE
+)
+WITH TAG (
+    DATA_SENSITIVITY = 'CONFIDENTIAL',
+    OWNER = 'DataEng'
+);
+
+-- this is for column level tags
+ALTER TABLE CUSTOMERS MODIFY COLUMN SSN SET TAG DATA_SENSITIVITY = 'CONFIDENTIAL'
+
+INSERT INTO CUSTOMERS (CUSTOMER_ID, NAME, EMAIL, SSN, COUNTRY, CREATED_AT)
+VALUES
+  (1, 'John Doe', 'john.doe@example.com', '123-45-6789', 'USA', '2023-01-01'),
+  (2, 'Jane Smith', 'jane.smith@example.com', '987-65-4321', 'USA', '2023-02-10'),
+  (3, 'Akira Tanaka', 'akira.tanaka@example.jp', '321-65-9874', 'JAPAN', '2023-03-20'),	
+  (4, 'Maria Gonzalez', 'maria.g@example.mx', '654-12-7890', 'MEXICO', '2023-04-12'),
+  (5, 'David Chen', 'david.chen@example.cn', '432-10-5678', 'CHINA', '2023-05-22');
+
+CREATE OR REPLACE MASKING POLICY MASK_PII_POLICY_NEW
+  AS (val STRING) RETURNS STRING ->
+  CASE
+    WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN', 'SECURITYADMIN') THEN val
+    ELSE '***MASKED***'
+  END;
+
+ALTER TAG DATA_SENSITIVITY SET MASKING POLICY MASK_PII_POLICY_NEW;
+
+SELECT * FROM CUSTOMERS
